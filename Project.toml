@@ -3,11 +3,15 @@ uuid = "011259fc-9966-43cf-b133-c07697828ebb"
 authors = ["Artem Solod <no@email.no> and contributors"]
 version = "0.1.0"
 
-[extras]
-Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+[deps]
+Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
 
 [compat]
+Mmap = "1.11.0"
 julia = "1.11"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
 test = ["Test"]
