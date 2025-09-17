@@ -1,7 +1,7 @@
 module ArenaPirate
 import Mmap: MADV_HUGEPAGE
 
-export activate_arena!, @arena, @noarena, copy_from_arena, mtmap_arena
+export activate_arena!, @arena, @noarena, copy_from_arena, mtmap_arena, map_arena
 
 # can we assert arena is free after the end of use? this happens automatically, doesn't it? so what can be asserted?
 # have immutable arena to save on indirection?
@@ -19,6 +19,7 @@ mutable struct Arena
     # @atomic offset :: Int
     offset :: Int
     task :: Task
+    debug :: Bool
 end
 
 const arena = Base.ScopedValues.ScopedValue{Union{Nothing, Arena}}(nothing)
@@ -32,7 +33,7 @@ function Arena(capacity=2^27)
     else
         ptr = Libc.malloc(capacity)
     end
-    finalizer(Arena(ptr, capacity, true, 0, current_task())) do a
+    finalizer(Arena(ptr, capacity, true, 0, current_task(), false)) do a
         Libc.free(a.ptr)
     end
 end
@@ -117,12 +118,15 @@ end
 @inline function alloc_arena!(arena :: Arena, ::Type{T}, nels) where T # fails without Arena typed explicitly
     if (current_task() === arena.task) && arena.active
         # since no other task uses this arena we don't worry about concurrency bugs
-        nbytes = nels * sizeof(T)
-        mem_avail = arena.capacity - arena.offset
+        elsz = Base.aligned_sizeof(T)
+        nbytes = nels * elsz
+        offset_cand = arena.offset + nbytes
+        offset_cand = (offset_cand + (elsz - 1)) & ~(elsz - 1) # enforce alignment
+        mem_avail = arena.capacity - offset_cand
         if mem_avail >= nbytes
             # offset_new = @atomic arena.offset += nbytes
-            offset_new = arena.offset += nbytes
-            ptr_cur = arena.ptr + offset_new - nbytes
+            arena.offset = offset_cand
+            ptr_cur = arena.ptr + arena.offset - nbytes
             mem = @ccall jl_ptr_to_genericmemory(Memory{T}::Any, ptr_cur::Ptr{Cvoid}, nbytes::Csize_t, 0::Cint) :: Memory{T}
             return mem
         end
@@ -136,17 +140,24 @@ function mtmap_arena(f, els)
     fetch.([Threads.@spawn (@arena f(el)) for el in els])
 end
 
+function map_arena(f, els)
+    map(x -> @arena(f(x)), els)
+end
+
 # function clear_arena_pool!(pool_sz=0)
 #     resize!(arena_pool.pool, pool_sz)
 # end
 
 function activate_arena!(types=(Float64, Int64, UInt8))
-    for tid in 1:Threads.nthreads()
+    for tid in 1:(Threads.nthreads(:interactive) + Threads.nthreads(:default) - length(arena_pool.pool))
         push!(arena_pool.pool, Arena[])
     end
     @eval begin
         @inline function Memory{T}(::UndefInitializer, m::Int64) where T <: Any
             if isbitstype(T) && !isnothing(arena[]) && (m * sizeof(T) > 2000) #(m >= (2^12 ÷ sizeof($T))) # GC_PERM_POOL_LIMIT, GC_MAX_SZCLASS
+                if arena[].debug
+                    @show T, m
+                end
                 alloc_arena!(arena[], T, m)
             else
                 @ccall jl_alloc_genericmemory(Memory{T}::Any, m::Csize_t)::Memory{T}
