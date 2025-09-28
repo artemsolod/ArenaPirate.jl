@@ -3,7 +3,7 @@ import Mmap: MADV_HUGEPAGE
 using Base.Threads
 using Base.ScopedValues
 
-export @arena, @noarena, copy_from_arena, mtmap_arena, map_arena, clear_arena_pool!
+export @arena, @noarena, clear_arena_pool!, copy_from_arena, mtmap_arena, map_arena
 
 mutable struct Arena
     const ptr::Ptr{Nothing}
@@ -44,7 +44,7 @@ function Arena(; capacity=nothing, min_alloc=nothing)
     end
 end
 
-function reset_arena!(arena, tgt_offset=0)
+function _reset_arena!(arena, tgt_offset=0)
     arena.active = true
     arena.offset = tgt_offset
     return arena
@@ -76,7 +76,7 @@ macro arena(call)
             arena2use.active = active_orig
             if isnothing(arena[]) # outermost use done, can returned it into the pool
                 iszero(arena2use.offset) || error("Arena's cursor should have returned to zero. Expect bugs.")
-                reset_arena!(arena2use)
+                _reset_arena!(arena2use)
                 lock(arena_pool.lock) do
                     push!(arena_pool.pool[tid], arena2use)
                 end
@@ -109,7 +109,7 @@ function copy_from_arena(x)
     @arena(@noarena(copy(x)))
 end
 
-@inline function alloc_arena!(arena::Arena, ::Type{T}, nels) where T # fails without Arena typed explicitly
+@inline function _alloc_arena!(arena::Arena, ::Type{T}, nels) where T # fails without Arena typed explicitly
     # @show T, nels
     if (current_task() === arena.task) && arena.active
         # since no other task uses this arena we don't worry about concurrency bugs
@@ -132,7 +132,7 @@ end
 
 @inline function Memory{T}(::UndefInitializer, m::Int64) where T<:Any
     if isbitstype(T) && !isnothing(arena[]) && (m * sizeof(T) >= arena[].min_alloc) #(m >= (2^12 ÷ sizeof($T))) 
-        alloc_arena!(arena[], T, m)
+        _alloc_arena!(arena[], T, m)
     else
         @ccall jl_alloc_genericmemory(Memory{T}::Any, m::Csize_t)::Memory{T}
     end
