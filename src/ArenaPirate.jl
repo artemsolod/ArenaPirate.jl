@@ -27,20 +27,20 @@ function Arena(; capacity=nothing, min_alloc=nothing)
     min_alloc = @something(min_alloc, arena_pool.min_alloc[])
 
     @static if Sys.isunix()
-        # ptr = @ccall pvalloc(capacity::Csize_t)::Ptr{Cvoid} # depreceated pvalloc
+        ptr = @ccall pvalloc(capacity::Csize_t)::Ptr{Cvoid} # depreceated pvalloc
         # PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS  
-        ptr = @ccall mmap(C_NULL::Ptr{Cvoid}, capacity::Csize_t, 3::Cint, 34::Cint, (-1)::Cint, 0::Csize_t)::Ptr{Cvoid}
+        # ptr = @ccall mmap(C_NULL::Ptr{Cvoid}, capacity::Csize_t, 3::Cint, 34::Cint, (-1)::Cint, 0::Csize_t)::Ptr{Cvoid}
         retcode = @ccall madvise(ptr::Ptr{Cvoid}, capacity::Csize_t, MADV_HUGEPAGE::Cint)::Cint
         iszero(retcode) || @warn "Madvise HUGEPAGE for arena memory failed"
     else
         ptr = Libc.malloc(capacity)
     end
     finalizer(Arena(ptr, capacity, true, 0, min_alloc, current_task())) do a
-        @static if Sys.isunix()
-            @ccall munmap(ptr::Ptr{Cvoid}, capacity::Csize_t)::Cint
-        else
-            Libc.free(a.ptr)
-        end
+        # @static if Sys.isunix()
+            # @ccall munmap(ptr::Ptr{Cvoid}, capacity::Csize_t)::Cint
+        # else
+        Libc.free(a.ptr)
+        # end
     end
 end
 
@@ -109,12 +109,11 @@ function copy_from_arena(x)
     @arena(@noarena(copy(x)))
 end
 
-@inline function _alloc_arena!(arena::Arena, ::Type{T}, nels) where T # fails without Arena typed explicitly
-    # @show T, nels
-    if (current_task() === arena.task) && arena.active
+function _alloc_arena!(arena::Arena, ::Type{T}, nels) where T # fails without Arena typed explicitly
+    elsz = Base.aligned_sizeof(T)
+    nbytes = nels * elsz
+    if (current_task() === arena.task) && arena.active && (nbytes >= arena.min_alloc) && (nbytes > 0)
         # since no other task uses this arena we don't worry about concurrency bugs
-        elsz = Base.aligned_sizeof(T)
-        nbytes = nels * elsz
         offset_cand = arena.offset + nbytes
         offset_cand = (offset_cand + (elsz - 1)) & ~(elsz - 1) # enforce alignment
         if offset_cand < arena.capacity
@@ -130,8 +129,10 @@ end
     @ccall jl_alloc_genericmemory(Memory{T}::Any, nels::Csize_t)::Memory{T}
 end
 
-@inline function Memory{T}(::UndefInitializer, m::Int64) where T<:Any
-    if isbitstype(T) && !isnothing(arena[]) && (m * sizeof(T) >= arena[].min_alloc) #(m >= (2^12 ÷ sizeof($T))) 
+function Memory{T}(::UndefInitializer, m::Int64) where T<:Any
+    # zero element allocations seem to exist and cause problems
+    if !isnothing(arena[]) && isbitstype(T)
+        # @noarena @show(m, T)
         _alloc_arena!(arena[], T, m)
     else
         @ccall jl_alloc_genericmemory(Memory{T}::Any, m::Csize_t)::Memory{T}
