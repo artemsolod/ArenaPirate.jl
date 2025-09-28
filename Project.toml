@@ -1,6 +1,6 @@
 name = "ArenaPirate"
 uuid = "011259fc-9966-43cf-b133-c07697828ebb"
-authors = ["Artem Solod <no@email.no> and contributors"]
+authors = ["Artem Solod"]
 version = "0.1.0"
 
 [deps]
