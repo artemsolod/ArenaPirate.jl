@@ -3,7 +3,7 @@ import Mmap: MADV_HUGEPAGE
 using Base.Threads
 using Base.ScopedValues
 
-export @arena, @noarena, clear_arena_pool!, copy_from_arena, mtmap_arena, map_arena
+export @arena, @noarena, clear_arena_pool!, copyfromarena, mtmap_arena, map_arena
 
 mutable struct Arena
     const ptr::Ptr{Nothing}
@@ -17,30 +17,31 @@ end
 const arena = Base.ScopedValues.ScopedValue{Union{Nothing,Arena}}(nothing)
 const arena_pool = (;
     capacity=Ref{Int}(2^27),
-    min_alloc=Ref{Int}(0), # GC_PERM_POOL_LIMIT, GC_MAX_SZCLASS?
-    lock=ReentrantLock(),
+    min_alloc=Ref{Int}(2032 - sizeof(Ptr{Nothing})), # GC_MAX_SZCLASS (2032-sizeof(void*))
+    lock=ReentrantLock(), # SpinLock(),
     pool=Vector{Vector{Arena}}(), # should try to avoid moving arenas across cores / threads
 )
+const min_alloc = 2032 - sizeof(Ptr{Nothing}) # GC_MAX_SZCLASS (2032-sizeof(void*))
 
 function Arena(; capacity=nothing, min_alloc=nothing)
     capacity = @something(capacity, arena_pool.capacity[])
     min_alloc = @something(min_alloc, arena_pool.min_alloc[])
 
     @static if Sys.isunix()
-        ptr = @ccall pvalloc(capacity::Csize_t)::Ptr{Cvoid} # depreceated pvalloc
+        # ptr = @ccall pvalloc(capacity::Csize_t)::Ptr{Cvoid} # depreceated pvalloc
         # PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS  
-        # ptr = @ccall mmap(C_NULL::Ptr{Cvoid}, capacity::Csize_t, 3::Cint, 34::Cint, (-1)::Cint, 0::Csize_t)::Ptr{Cvoid}
+        ptr = @ccall mmap(C_NULL::Ptr{Cvoid}, capacity::Csize_t, 3::Cint, 34::Cint, (-1)::Cint, 0::Csize_t)::Ptr{Cvoid}
         retcode = @ccall madvise(ptr::Ptr{Cvoid}, capacity::Csize_t, MADV_HUGEPAGE::Cint)::Cint
         iszero(retcode) || @warn "Madvise HUGEPAGE for arena memory failed"
     else
         ptr = Libc.malloc(capacity)
     end
     finalizer(Arena(ptr, capacity, true, 0, min_alloc, current_task())) do a
-        # @static if Sys.isunix()
-            # @ccall munmap(ptr::Ptr{Cvoid}, capacity::Csize_t)::Cint
-        # else
-        Libc.free(a.ptr)
-        # end
+        @static if Sys.isunix()
+            @ccall munmap(ptr::Ptr{Cvoid}, capacity::Csize_t)::Cint
+        else
+            Libc.free(a.ptr)
+        end
     end
 end
 
@@ -53,7 +54,10 @@ end
 macro arena(call)
     quote
         tid = threadid()
-        if isnothing(arena[])
+        arenavisible = arena[]
+        isoutermostarena = false
+        if isnothing(arenavisible)
+            isoutermostarena = true
             arena2use = lock(arena_pool.lock) do
                 if isempty(arena_pool.pool[tid])
                     Arena()
@@ -64,18 +68,22 @@ macro arena(call)
                 end
             end
         else
-            arena2use::Arena = arena[]
+            arena2use::Arena = arenavisible
         end
         offset_orig = arena2use.offset
         active_orig = arena2use.active
         try
             arena2use.active = true
-            @with arena => arena2use $(esc(call))
+            if isoutermostarena
+                @with arena=>arena2use $(esc(call))
+            else
+                $(esc(call))
+            end
         finally
             arena2use.offset = offset_orig
             arena2use.active = active_orig
-            if isnothing(arena[]) # outermost use done, can returned it into the pool
-                iszero(arena2use.offset) || error("Arena's cursor should have returned to zero. Expect bugs.")
+            if isoutermostarena # can return the arena into the pool
+                iszero(arena2use.offset) || @warn "Arena's offset should have returned to zero. Expect bugs."
                 _reset_arena!(arena2use)
                 lock(arena_pool.lock) do
                     push!(arena_pool.pool[tid], arena2use)
@@ -86,15 +94,16 @@ macro arena(call)
 end
 
 macro noarena(call)
-    # if we have an arena, switch it's status to inactive
+    # if we have an arena, switch its status to inactive
     quote
-        if isnothing(arena[])
+        arenavisible = arena[] 
+        if isnothing(arenavisible)
             $(esc(call))
         else
-            arena2use = arena[]
+            arena2use :: Arena = arenavisible
             active_orig = arena2use.active
-            arena2use.active = false
             try
+                arena2use.active = false
                 $(esc(call))
             finally
                 arena2use.active = active_orig
@@ -103,17 +112,18 @@ macro noarena(call)
     end
 end
 
-function copy_from_arena(x)
+function copyfromarena(x)
     # ugly but ensures we don't return arena to pool prior to copying
     # simply `with(arena => nothing)` will interfere with nested `@arena` uses
     @arena(@noarena(copy(x)))
 end
 
-function _alloc_arena!(arena::Arena, ::Type{T}, nels) where T # fails without Arena typed explicitly
+@inline function _alloc_arena!(arena::Arena, ::Type{T}, nels) where T # fails without Arena typed explicitly
     elsz = Base.aligned_sizeof(T)
     nbytes = nels * elsz
-    if (current_task() === arena.task) && arena.active && (nbytes >= arena.min_alloc) && (nbytes > 0)
+    if (current_task() === arena.task) && arena.active && (nbytes > 0) && (nbytes >= min_alloc)
         # since no other task uses this arena we don't worry about concurrency bugs
+        # @noarena @show(m, T)
         offset_cand = arena.offset + nbytes
         offset_cand = (offset_cand + (elsz - 1)) & ~(elsz - 1) # enforce alignment
         if offset_cand < arena.capacity
@@ -129,14 +139,15 @@ function _alloc_arena!(arena::Arena, ::Type{T}, nels) where T # fails without Ar
     @ccall jl_alloc_genericmemory(Memory{T}::Any, nels::Csize_t)::Memory{T}
 end
 
-function Memory{T}(::UndefInitializer, m::Int64) where T<:Any
+@inline function Memory{T}(::UndefInitializer, m::Int64) where T<:Any
     # zero element allocations seem to exist and cause problems
-    if !isnothing(arena[]) && isbitstype(T)
-        # @noarena @show(m, T)
-        _alloc_arena!(arena[], T, m)
-    else
-        @ccall jl_alloc_genericmemory(Memory{T}::Any, m::Csize_t)::Memory{T}
+    if isbitstype(T)
+        arena2use = arena[]
+        if !isnothing(arena2use)
+            return _alloc_arena!(arena2use, T, m)
+        end
     end
+    return @ccall jl_alloc_genericmemory(Memory{T}::Any, m::Csize_t)::Memory{T}
 end
 
 function clear_arena_pool!(pool_sz=0)
@@ -165,7 +176,7 @@ end # module ArenaPirate
 
 # have a dict of currently used arenas and pick it up again to allow for @arena -> @noarena -> @arena pattern
 
-# how to ensure `copy_from_arena` before arena is gone?
+# how to ensure `copyfromarena` before arena is gone?
 # should @noarena within @arena be ignored? can we have @banarena instead? 
 #    if @noarena is ignored within @areana - what is it's purpose then?
 #    imagine all is good except in one place you need to push!. wouldn't you want @noarena
