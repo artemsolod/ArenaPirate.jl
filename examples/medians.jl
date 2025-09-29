@@ -18,14 +18,15 @@ end
 
 Random.seed!(42)
 data = rand(10_000_000)
+nruns = 32
 f(data)
 res_f = @time f(data)
 
 repeated_f(data)
-res_rep_f = @time repeated_f(data)
+res_rep_f = @time repeated_f(data, nruns)
 
 repeated_f_mt(data)
-res_rep_f_mt = @time repeated_f_mt(data)
+res_rep_f_mt = @time repeated_f_mt(data, nruns)
 
 using ArenaPirate
 
@@ -50,10 +51,10 @@ f_arena(data)
 res_f_arena = @time f_arena(data)
 
 repeated_f_arena(data)
-res_rep_f_arena = @time repeated_f_arena(data)
+res_rep_f_arena = @time repeated_f_arena(data, nruns)
 
 repeated_f_mt_arena(data)
-res_rep_f_mt_arena = @time repeated_f_mt_arena(data)
+res_rep_f_mt_arena = @time repeated_f_mt_arena(data, nruns)
 
 @assert res_f == res_f_arena
 @assert res_rep_f == res_rep_f_arena
