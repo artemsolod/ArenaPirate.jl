@@ -19,13 +19,13 @@ end
 Random.seed!(42)
 data = rand(10_000_000)
 f(data)
-@time f(data)
+res_f = @time f(data)
 
 repeated_f(data)
-@time repeated_f(data)
+res_rep_f = @time repeated_f(data)
 
 repeated_f_mt(data)
-@time repeated_f_mt(data)
+res_rep_f_mt = @time repeated_f_mt(data)
 
 using ArenaPirate
 
@@ -47,10 +47,14 @@ end
 
 println("____ Arena benchmarks:")
 f_arena(data)
-@time f_arena(data)
+res_f_arena = @time f_arena(data)
 
 repeated_f_arena(data)
-@time repeated_f_arena(data)
+res_rep_f_arena = @time repeated_f_arena(data)
 
 repeated_f_mt_arena(data)
-@time repeated_f_mt_arena(data)
+res_rep_f_mt_arena = @time repeated_f_mt_arena(data)
+
+@assert res_f == res_f_arena
+@assert res_rep_f == res_rep_f_arena
+@assert res_rep_f_mt == res_rep_f_mt_arena
