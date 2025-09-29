@@ -55,9 +55,8 @@ macro arena(call)
     quote
         tid = threadid()
         arenavisible = arena[]
-        isoutermostarena = false
-        if isnothing(arenavisible)
-            isoutermostarena = true
+        isoutermostarena = isnothing(arenavisible)
+        if isoutermostarena 
             arena2use = lock(arena_pool.lock) do
                 if isempty(arena_pool.pool[tid])
                     Arena()
@@ -75,7 +74,7 @@ macro arena(call)
         try
             arena2use.active = true
             if isoutermostarena
-                @with arena=>arena2use $(esc(call))
+                @with arena => arena2use $(esc(call))
             else
                 $(esc(call))
             end
@@ -96,11 +95,11 @@ end
 macro noarena(call)
     # if we have an arena, switch its status to inactive
     quote
-        arenavisible = arena[] 
+        arenavisible = arena[]
         if isnothing(arenavisible)
             $(esc(call))
         else
-            arena2use :: Arena = arenavisible
+            arena2use::Arena = arenavisible
             active_orig = arena2use.active
             try
                 arena2use.active = false
@@ -143,9 +142,7 @@ end
     # zero element allocations seem to exist and cause problems
     if isbitstype(T)
         arena2use = arena[]
-        if !isnothing(arena2use)
-            return _alloc_arena!(arena2use, T, m)
-        end
+        isnothing(arena2use) || (return _alloc_arena!(arena2use, T, m))
     end
     return @ccall jl_alloc_genericmemory(Memory{T}::Any, m::Csize_t)::Memory{T}
 end
