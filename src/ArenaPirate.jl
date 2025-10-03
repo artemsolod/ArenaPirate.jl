@@ -17,16 +17,16 @@ end
 const arena = Base.ScopedValues.ScopedValue{Union{Nothing,Arena}}(nothing)
 const arena_pool = (;
     capacity=Ref{Int}(2^27),
-    min_alloc=Ref{Int}(2032 - sizeof(Ptr{Nothing})), # GC_MAX_SZCLASS (2032-sizeof(void*))
-    lock=ReentrantLock(), # SpinLock(),
+    # min_alloc=Ref{Int}(2032 - sizeof(Ptr{Nothing})), # GC_MAX_SZCLASS (2032-sizeof(void*))
+    min_alloc=1000, # works well in practice
+    lock=SpinLock(), #ReentrantLock(), # spinlock noticeably faster
     pool=Vector{Vector{Arena}}(), # should try to avoid moving arenas across cores / threads
 )
-const min_alloc = 2032 - sizeof(Ptr{Nothing}) # GC_MAX_SZCLASS (2032-sizeof(void*))
 
 function Arena(; capacity=nothing, min_alloc=nothing)
     capacity = @something(capacity, arena_pool.capacity[])
     min_alloc = @something(min_alloc, arena_pool.min_alloc[])
-
+    # consider using `mmap(Vector{UInt8}, N).ref.mem` to avoid ccalls
     @static if Sys.isunix()
         # ptr = @ccall pvalloc(capacity::Csize_t)::Ptr{Cvoid} # depreceated pvalloc
         # PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS  
@@ -55,8 +55,7 @@ macro arena(call)
     quote
         tid = threadid()
         arenavisible = arena[]
-        isoutermostarena = isnothing(arenavisible)
-        if isoutermostarena 
+        if (isoutermostarena = isnothing(arenavisible))
             arena2use = lock(arena_pool.lock) do
                 if isempty(arena_pool.pool[tid])
                     Arena()
@@ -73,6 +72,7 @@ macro arena(call)
         active_orig = arena2use.active
         try
             arena2use.active = true
+            # @with arena => arena2use $(esc(call))
             if isoutermostarena
                 @with arena => arena2use $(esc(call))
             else
@@ -120,7 +120,7 @@ end
 @inline function _alloc_arena!(arena::Arena, ::Type{T}, nels) where T # fails without Arena typed explicitly
     elsz = Base.aligned_sizeof(T)
     nbytes = nels * elsz
-    if (current_task() === arena.task) && arena.active && (nbytes > 0) && (nbytes >= min_alloc)
+    if (current_task() === arena.task) && arena.active && (nbytes > 0) && (nbytes >= arena.min_alloc)
         # since no other task uses this arena we don't worry about concurrency bugs
         # @noarena @show(m, T)
         offset_cand = arena.offset + nbytes
@@ -138,7 +138,7 @@ end
     @ccall jl_alloc_genericmemory(Memory{T}::Any, nels::Csize_t)::Memory{T}
 end
 
-@inline function Memory{T}(::UndefInitializer, m::Int64) where T<:Any
+function Memory{T}(::UndefInitializer, m::Int64) where T<:Any
     # zero element allocations seem to exist and cause problems
     if isbitstype(T)
         arena2use = arena[]
@@ -149,10 +149,20 @@ end
 
 function clear_arena_pool!(pool_sz=0)
     resize!(arena_pool.pool, pool_sz)
+    __init__()
 end
 
 map_arena(f, els) = map(x -> @arena(f(x)), els)
-mtmap_arena(f, els) = fetch.([@spawn (@arena f(el)) for el in els])
+mtmap_arena(f, els) = fetch.([@spawn (@arena f(el)) for el in els]) 
+
+# spawning all at once may be problematic because we request all arenas at once and use too many of them
+# function mtmap_arena(f, els)
+#     #     res = Vector{Any}(undef, length(els))
+#     #     Threads.@threads for ix in 1:length(res)
+#     #         res[ix] = f(els[ix])
+#     #     end
+#     #     return res
+# end
 
 function __init__()
     for _ in 1:(nthreads(:interactive)+nthreads(:default)-length(arena_pool.pool))
@@ -162,6 +172,10 @@ end
 
 end # module ArenaPirate
 
+# # Strange behaviour
+# - zero element allocations on arena seem to cause problems
+
+# don't use ScopedValues at all? Just an arena per task in task storage?
 
 # max_arenas_per_thread=Ref{Int}(typemax(Int)),
 # allocating everything or over certain size? can exceptions work?
